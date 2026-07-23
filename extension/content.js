@@ -427,6 +427,247 @@ function cancelPickMode() {
 // page. It also wakes a suspended worker without requiring the side panel.
 browserApi.runtime.sendMessage({ type: 'HERMES_CONTROLLER_DOCUMENT_READY' }).catch(() => {});
 
+// ============================================================
+// v3: 交互式工具 — 元素查找 / 表单填写 / 点击 / 执行 JS / 页面快照
+// ============================================================
+
+/**
+ * 多策略元素查找
+ * @param {string} selector - 选择器值
+ * @param {string} selectorType - css | xpath | text | name | placeholder | aria_label
+ * @returns {Element|null}
+ */
+function findElement(selector, selectorType = 'css') {
+  if (!selector) return null;
+  const s = String(selector).trim();
+
+  switch (selectorType) {
+    case 'css':
+      return document.querySelector(s);
+
+    case 'xpath':
+      try {
+        const result = document.evaluate(
+          s, document, null,
+          XPathResult.FIRST_ORDERED_NODE_TYPE, null
+        );
+        return result.singleNodeValue;
+      } catch {
+        return null;
+      }
+
+    case 'name':
+      return document.querySelector(`[name="${s.replace(/"/g, '\\"')}"]`);
+
+    case 'placeholder':
+      return document.querySelector(`[placeholder="${s.replace(/"/g, '\\"')}"]`)
+        || document.querySelector(`[placeholder*="${s.replace(/"/g, '\\"')}"]`);
+
+    case 'aria_label':
+      return document.querySelector(`[aria-label="${s.replace(/"/g, '\\"')}"]`)
+        || document.querySelector(`[aria-label*="${s.replace(/"/g, '\\"')}"]`);
+
+    case 'text':
+      // 按文本内容查找按钮/链接/标签 — 先精确匹配，再包含匹配
+      for (const tag of ['button', 'a', 'label', 'span', 'div', 'input[type="submit"]', '[role="button"]']) {
+        const elems = document.querySelectorAll(tag);
+        for (const el of elems) {
+          const txt = (el.textContent || '').trim();
+          if (txt === s) return el;
+        }
+      }
+      for (const tag of ['button', 'a', 'label', 'span', 'div', 'input[type="submit"]', '[role="button"]']) {
+        const elems = document.querySelectorAll(tag);
+        for (const el of elems) {
+          const txt = (el.textContent || '').trim();
+          if (txt.includes(s)) return el;
+        }
+      }
+      return null;
+
+    default:
+      return document.querySelector(s);
+  }
+}
+
+/**
+ * 填写表单字段
+ */
+function handleFormFill({ selector, value, selectorType = 'css' }) {
+  const el = findElement(selector, selectorType);
+  if (!el) return { ok: false, error: `element not found: ${selector} (type=${selectorType})` };
+
+  const tag = el.tagName?.toLowerCase?.() || '';
+  const type = (el.getAttribute?.('type') || '').toLowerCase();
+
+  try {
+    if (tag === 'select') {
+      // <select> 元素
+      const option = Array.from(el.options).find(
+        (o) => o.value === value || o.textContent?.trim() === value
+      );
+      if (option) {
+        el.value = option.value;
+      } else {
+        el.value = value;
+      }
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+
+    } else if (type === 'checkbox' || type === 'radio') {
+      const boolVal = value === 'true' || value === true;
+      if (el.checked !== boolVal) {
+        el.click();
+      }
+
+    } else {
+      // text/textarea/input 等
+      // 先聚焦清空再填值，模拟真实输入
+      el.focus();
+      el.value = '';
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.value = value;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    return {
+      ok: true,
+      filled: true,
+      element: {
+        tag,
+        type: type || tag,
+        name: el.getAttribute?.('name') || '',
+        id: el.id || '',
+        selector: buildCssSelector(el),
+      },
+    };
+  } catch (err) {
+    return { ok: false, error: err.message, element_tag: tag };
+  }
+}
+
+/**
+ * 点击元素
+ */
+function handleElementClick({ selector, selectorType = 'css' }) {
+  const el = findElement(selector, selectorType);
+  if (!el) return { ok: false, error: `element not found: ${selector} (type=${selectorType})` };
+
+  const tag = el.tagName?.toLowerCase?.() || '';
+
+  try {
+    // 先尝试原生 click
+    el.click();
+
+    // 对于某些需要 mousedown/mouseup 的元素也触发一下
+    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+
+    return {
+      ok: true,
+      clicked: true,
+      element: {
+        tag,
+        text: (el.textContent || '').trim().slice(0, 200),
+        href: el.href || '',
+        selector: buildCssSelector(el),
+      },
+    };
+  } catch (err) {
+    return { ok: false, error: err.message, element_tag: tag };
+  }
+}
+
+/**
+ * 执行 JavaScript
+ */
+function handleEvaluateJs({ script }) {
+  if (!script) return { ok: false, error: 'empty script' };
+  try {
+    const result = eval(String(script));
+    // 尝试序列化结果
+    let serialized;
+    try {
+      serialized = JSON.parse(JSON.stringify(result));
+    } catch {
+      serialized = String(result);
+    }
+    return { ok: true, result: serialized };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+/**
+ * 页面快照 — 收集所有可交互元素
+ */
+function collectPageSnapshot() {
+  const interactiveSelectors = [
+    'a[href]', 'button', 'input', 'textarea', 'select',
+    '[role="button"]', '[role="link"]', '[role="textbox"]',
+    '[role="combobox"]', '[role="checkbox"]', '[role="radio"]',
+    '[contenteditable="true"]', '[tabindex]',
+  ];
+
+  const items = [];
+  const seen = new Set();
+  let idx = 0;
+
+  for (const sel of interactiveSelectors) {
+    const elems = document.querySelectorAll(sel);
+    for (const el of elems) {
+      const tag = el.tagName?.toLowerCase?.() || '';
+      const type = (el.getAttribute?.('type') || '').toLowerCase();
+      const name = el.getAttribute?.('name') || '';
+      const id = el.id || '';
+      const placeholder = el.getAttribute?.('placeholder') || '';
+      const ariaLabel = el.getAttribute?.('aria-label') || '';
+      const href = el.href || '';
+      const text = (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+      const value = el.value || '';
+      const disabled = el.disabled || el.getAttribute?.('aria-disabled') === 'true';
+      const checked = el.checked || false;
+
+      // 去重
+      const key = `${tag}|${type}|${name}|${id}|${placeholder}|${ariaLabel}|${text.slice(0, 40)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const display = el.offsetParent !== null || el.checkVisibility?.() !== false;
+
+      idx++;
+      const item = {
+        ref: `@e${idx}`,
+        tag,
+        display,
+      };
+
+      if (type) item.type = type;
+      if (name) item.name = name;
+      if (id) item.id = id;
+      if (placeholder) item.placeholder = placeholder;
+      if (ariaLabel) item.ariaLabel = ariaLabel;
+      if (href) item.href = href.slice(0, 300);
+      if (text) item.text = text;
+      if (value && type !== 'hidden' && type !== 'password') item.value = value.slice(0, 80);
+      if (disabled) item.disabled = true;
+      if (checked) item.checked = true;
+
+      items.push(item);
+    }
+  }
+
+  return {
+    ok: true,
+    title: document.title || '',
+    url: location.href,
+    elements: items.slice(0, 200),  // 最多 200 个元素
+    totalFound: idx,
+    capturedAt: new Date().toISOString(),
+  };
+}
+
 const messageListener = (message, _sender, sendResponse) => {
   if (message?.type === BROWSER_CONTROL_INDICATOR_MESSAGE) {
     if (message.phase === 'finish') removeBrowserControlIndicator();
@@ -468,6 +709,39 @@ const messageListener = (message, _sender, sendResponse) => {
   if (message?.type === ELEMENT_PICK_MESSAGES.CANCEL) {
     try {
       sendResponse(cancelPickMode());
+    } catch (error) {
+      sendResponse({ ok: false, error: error?.message || String(error) });
+    }
+    return true;
+  }
+  // v3: 交互式工具
+  if (message?.type === 'HERMES_FORM_FILL') {
+    try {
+      sendResponse(handleFormFill(message));
+    } catch (error) {
+      sendResponse({ ok: false, error: error?.message || String(error) });
+    }
+    return true;
+  }
+  if (message?.type === 'HERMES_ELEMENT_CLICK') {
+    try {
+      sendResponse(handleElementClick(message));
+    } catch (error) {
+      sendResponse({ ok: false, error: error?.message || String(error) });
+    }
+    return true;
+  }
+  if (message?.type === 'HERMES_EVALUATE_JS') {
+    try {
+      sendResponse(handleEvaluateJs(message));
+    } catch (error) {
+      sendResponse({ ok: false, error: error?.message || String(error) });
+    }
+    return true;
+  }
+  if (message?.type === 'HERMES_PAGE_SNAPSHOT') {
+    try {
+      sendResponse(collectPageSnapshot());
     } catch (error) {
       sendResponse({ ok: false, error: error?.message || String(error) });
     }

@@ -808,3 +808,353 @@ initI18n().catch((error) => {
 refreshPanelResidencyModeFromStorage().catch((error) => {
   console.warn('[Hermes Browser] Panel residency initialization failed:', error);
 });
+
+// ============================================================
+// Browser Task Bridge — Hermes Agent 通过任务服务器远程控制扩展
+// v3: 支持交互式会话 (open/fill/click/evaluate/snapshot/close)
+// v4: Bearer token 认证（token 来自 bridge-token.js，勿提交到仓库）
+// ============================================================
+
+import { BRIDGE_TOKEN } from './bridge-token.js';
+
+const TASK_SERVER_BASE = 'http://localhost:8643';
+const TASK_POLL_MS = 3000;
+let taskPollTimer = null;
+let taskBusy = false;
+
+// 跟踪已打开的浏览器会话标签页，防止被误关
+const sessionTabs = new Map();  // session_id -> tab_id
+
+async function pollPendingTask() {
+  if (taskBusy) return;
+  try {
+    const resp = await fetch(`${TASK_SERVER_BASE}/api/task/pending`, { signal: AbortSignal.timeout(5000) });
+    if (resp.status === 204) return;
+    if (!resp.ok) return;
+    const task = await resp.json();
+    if (task?.task_id) {
+      taskBusy = true;
+      try {
+        await executeTask(task);
+      } finally {
+        taskBusy = false;
+      }
+    }
+  } catch {
+  }
+}
+
+/**
+ * 等待页面加载完成
+ * @param {number} tabId
+ * @param {number} timeoutMs
+ * @returns {Promise<void>}
+ */
+function waitForTabLoad(tabId, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      reject(new Error('page_load_timeout'));
+    }, timeoutMs);
+    const onUpdated = (_tabId, changeInfo) => {
+      if (_tabId === tabId && changeInfo.status === 'complete') {
+        clearTimeout(timeout);
+        chrome.tabs.onUpdated.removeListener(onUpdated);
+        resolve();
+      }
+    };
+    chrome.tabs.onUpdated.addListener(onUpdated);
+  });
+}
+
+/**
+ * 向标签页发送消息并获取页面上下文
+ */
+async function getPageContext(tabId) {
+  // 短暂等待确保 content script 已注入
+  await new Promise((r) => setTimeout(r, 800));
+  try {
+    // 先尝试原生的 collectContext
+    const resp = await chrome.tabs.sendMessage(tabId, { type: 'HERMES_GET_PAGE_CONTEXT' });
+    return resp;
+  } catch (err) {
+    // 如果 content script 尚未注入，尝试用 scripting API 注入
+    console.warn('[TaskBridge] sendMessage failed, trying scripting.executeScript:', err.message);
+    try {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+          const t = document.title || '';
+          const u = location.href;
+          const b = (document.body?.innerText || '').slice(0, 8000);
+          return { ok: true, title: t, url: u, text: b, capturedAt: new Date().toISOString() };
+        },
+      });
+      return results?.[0]?.result || { ok: false, error: 'scripting_injection_failed' };
+    } catch (e2) {
+      return { ok: false, error: e2.message || String(e2) };
+    }
+  }
+}
+
+/**
+ * 向 MCP 服务器提交结果
+ */
+async function postResult(taskId, sessionId, result) {
+  const body = { ...result };
+  if (sessionId) body.session_id = sessionId;
+  try {
+    await fetch(`${TASK_SERVER_BASE}/api/task/${taskId}/result`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    console.error('[TaskBridge] Failed to post result:', err);
+  }
+}
+
+/**
+ * 主任务执行器 — 根据 action 分发
+ */
+async function executeTask(task) {
+  const {
+    task_id: taskId,
+    action = 'browse',
+    url = '',
+    tab_id: taskTabId,
+    params = {},
+  } = task;
+
+  // 从 params 中提取 session_id（由 REST API POST 传递或从 URL query 提取）
+  const sessionId = params.session_id || task.session_id || '';
+
+  try {
+    switch (action) {
+      case 'browse':
+        await handleBrowse(taskId, url);
+        break;
+
+      case 'open':
+        await handleOpen(taskId, sessionId, url);
+        break;
+
+      case 'close':
+        await handleClose(taskId, taskTabId);
+        break;
+
+      case 'fill':
+        await handleInteractive(taskId, sessionId, taskTabId, 'HERMES_FORM_FILL', {
+          selector: params.selector || '',
+          value: params.value || '',
+          selectorType: params.selector_type || 'css',
+        });
+        break;
+
+      case 'click':
+        await handleInteractive(taskId, sessionId, taskTabId, 'HERMES_ELEMENT_CLICK', {
+          selector: params.selector || '',
+          selectorType: params.selector_type || 'css',
+        });
+        break;
+
+      case 'evaluate':
+        await handleEvaluate(taskId, sessionId, taskTabId, params.script || '');
+        break;
+
+      case 'snapshot':
+        await handleInteractive(taskId, sessionId, taskTabId, 'HERMES_PAGE_SNAPSHOT', {});
+        break;
+
+      default:
+        await postResult(taskId, sessionId, { ok: false, error: `unknown action: ${action}` });
+    }
+  } catch (error) {
+    await postResult(taskId, sessionId, { ok: false, error: error?.message || String(error) });
+  }
+}
+
+/**
+ * 处理 browse — 打开 → 读内容 → 关闭
+ */
+async function handleBrowse(taskId, url) {
+  let tab = null;
+  try {
+    tab = await chrome.tabs.create({ url, active: false });
+    await waitForTabLoad(tab.id);
+    const context = await getPageContext(tab.id);
+    await postResult(taskId, '', context);
+  } catch (error) {
+    await postResult(taskId, '', { ok: false, error: error?.message || String(error) });
+  } finally {
+    if (tab?.id) {
+      try { await chrome.tabs.remove(tab.id); } catch { }
+    }
+  }
+}
+
+/**
+ * 处理 open — 打开 → 读内容 → 保持标签页打开 → 报告 tab_id
+ */
+async function handleOpen(taskId, sessionId, url) {
+  const tab = await chrome.tabs.create({ url, active: false });
+  if (sessionId) {
+    sessionTabs.set(sessionId, tab.id);
+  }
+  await waitForTabLoad(tab.id);
+  const context = await getPageContext(tab.id);
+  context.tab_id = tab.id;
+  context.session_id = sessionId;
+  await postResult(taskId, sessionId, context);
+}
+
+/**
+ * 处理 close — 关闭标签页 + 清理 session
+ */
+async function handleClose(taskId, tabId) {
+  if (tabId) {
+    try { await chrome.tabs.remove(tabId); } catch { }
+  }
+  // 清理 sessionTabs 中的记录
+  for (const [sid, tid] of sessionTabs) {
+    if (tid === tabId) {
+      sessionTabs.delete(sid);
+    }
+  }
+  await postResult(taskId, '', { ok: true, closed: true, tab_id: tabId });
+}
+
+/**
+ * 处理 evaluate — 使用 chrome.scripting.executeScript 注入执行 JS（绕过页面 CSP）
+ */
+async function handleEvaluate(taskId, sessionId, tabId, script) {
+  if (!tabId) {
+    await postResult(taskId, sessionId, { ok: false, error: 'no tab_id' });
+    return;
+  }
+  try {
+    await chrome.tabs.get(tabId);
+  } catch {
+    await postResult(taskId, sessionId, { ok: false, error: `tab ${tabId} no longer exists` });
+    return;
+  }
+
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: (code) => {
+        try {
+          // Wrap with return to capture expression result
+          let fn = new Function(code);
+          let result = fn();
+          // If the code didn't return anything, try wrapping as expression
+          if (result === undefined && !code.trim().startsWith('return')) {
+            result = new Function('return (' + code + ')')();
+          }
+          if (result === undefined) return { ok: true, result: null };
+          try { JSON.stringify(result); return { ok: true, result: result }; }
+          catch { return { ok: true, result: String(result) }; }
+        } catch (e) {
+          return { ok: false, error: e.message || String(e) };
+        }
+      },
+      args: [script],
+    });
+    const evalResult = results?.[0]?.result || { ok: false, error: 'executeScript_failed' };
+    const context = await getPageContext(tabId);
+    await postResult(taskId, sessionId, {
+      ...context,
+      ok: evalResult.ok !== false,
+      interaction: evalResult,
+    });
+  } catch (err) {
+    await postResult(taskId, sessionId, { ok: false, error: `evaluate failed: ${err.message}` });
+  }
+}
+
+/**
+ * 处理交互式动作 — fill / click / snapshot
+ * 使用已有的 tab，发送消息给 content script
+ */
+async function handleInteractive(taskId, sessionId, tabId, messageType, messageParams) {
+  if (!tabId) {
+    await postResult(taskId, sessionId, { ok: false, error: 'no tab_id — session may have expired' });
+    return;
+  }
+
+  // 验证 tab 仍存在
+  try {
+    await chrome.tabs.get(tabId);
+  } catch {
+    await postResult(taskId, sessionId, { ok: false, error: `tab ${tabId} no longer exists` });
+    return;
+  }
+
+  // 对于 click，需要监听可能的导航
+  let navPromise = null;
+  if (messageType === 'HERMES_ELEMENT_CLICK') {
+    navPromise = waitForTabLoad(tabId, 15000).catch(() => null);
+  }
+
+  // 发送消息给 content script
+  let response;
+  try {
+    response = await chrome.tabs.sendMessage(tabId, {
+      type: messageType,
+      ...messageParams,
+    });
+  } catch (err) {
+    // 可能 content script 未加载，尝试用 scripting API 注入
+    console.warn('[TaskBridge] Interactive sendMessage failed:', err.message);
+    await postResult(taskId, sessionId, { ok: false, error: `content_script_unavailable: ${err.message}` });
+    return;
+  }
+
+  // 如果进行了点击，等待导航完成后再获取页面上下文
+  if (navPromise) {
+    await navPromise;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+
+  // 获取当前页面上下文（与交互结果合并）
+  const context = await getPageContext(tabId);
+  const result = {
+    ...context,
+    ok: response?.ok !== false,
+    interaction: response,
+  };
+  result.tab_id = tabId;
+  result.session_id = sessionId;
+  await postResult(taskId, sessionId, result);
+}
+
+function startTaskPolling() {
+  stopTaskPolling();
+  pollPendingTask();
+  taskPollTimer = setInterval(pollPendingTask, TASK_POLL_MS);
+  chrome.alarms?.create?.('hermes-task-poll', { periodInMinutes: 1 });
+}
+
+function stopTaskPolling() {
+  if (taskPollTimer) {
+    clearInterval(taskPollTimer);
+    taskPollTimer = null;
+  }
+  try {
+    chrome.alarms?.clear?.('hermes-task-poll')?.catch?.(() => {});
+  } catch {
+    // chrome.alarms may be unavailable in non-extension test environments
+  }
+}
+
+// 仅在扩展环境中启动轮询（chrome.alarms 在测试 mock 中不存在，避免模块加载崩溃）
+if (chrome.alarms?.create) {
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === 'hermes-task-poll') {
+      startTaskPolling();
+    }
+  });
+
+  startTaskPolling();
+}

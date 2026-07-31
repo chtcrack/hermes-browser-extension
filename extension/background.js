@@ -950,10 +950,24 @@ let taskBusy = false;
 // 跟踪已打开的浏览器会话标签页，防止被误关
 const sessionTabs = new Map();  // session_id -> tab_id
 
+function bridgeHeaders(extra = {}) {
+  return {
+    ...extra,
+    Authorization: `Bearer ${BRIDGE_TOKEN}`,
+  };
+}
+
 async function pollPendingTask() {
   if (taskBusy) return;
+  if (!BRIDGE_TOKEN) {
+    console.warn('[TaskBridge] BRIDGE_TOKEN missing — check extension/bridge-token.js');
+    return;
+  }
   try {
-    const resp = await fetch(`${TASK_SERVER_BASE}/api/task/pending`, { signal: AbortSignal.timeout(5000) });
+    const resp = await fetch(`${TASK_SERVER_BASE}/api/task/pending`, {
+      signal: AbortSignal.timeout(5000),
+      headers: bridgeHeaders(),
+    });
     if (resp.status === 204) return;
     if (!resp.ok) return;
     const task = await resp.json();
@@ -1031,7 +1045,7 @@ async function postResult(taskId, sessionId, result) {
   try {
     await fetch(`${TASK_SERVER_BASE}/api/task/${taskId}/result`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: bridgeHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(body),
     });
   } catch (err) {

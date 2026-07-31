@@ -48,3 +48,4 @@ docs/
 .omx/
 CLAUDE.md
 AGENTS.md
+extension/bridge-token.js

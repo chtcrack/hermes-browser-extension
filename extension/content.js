@@ -600,6 +600,29 @@ function handleEvaluateJs({ script }) {
 }
 
 /**
+ * 收集页面链接（纯 DOM 读取，不受页面 CSP 限制；供 browse_url 返回帖子链接）
+ * 2026-08-07: extractor 的 structure.links 未透传到 meta，此函数直接读 DOM 补上
+ */
+function collectPageLinks() {
+  const links = [];
+  const seen = new Set();
+  const anchors = document.querySelectorAll('a[href]');
+  for (const a of anchors) {
+    const href = a.getAttribute('href') || '';
+    if (!href || href.startsWith('javascript:') || href.startsWith('#')) continue;
+    let abs;
+    try { abs = new URL(href, location.href).href; } catch (_e) { continue; }
+    if (!/^https?:/.test(abs)) continue;
+    if (seen.has(abs)) continue;
+    seen.add(abs);
+    const text = (a.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 200);
+    links.push({ text, url: abs });
+    if (links.length >= 100) break;
+  }
+  return links;
+}
+
+/**
  * 页面快照 — 收集所有可交互元素
  */
 function collectPageSnapshot() {
@@ -686,7 +709,13 @@ const messageListener = (message, _sender, sendResponse) => {
   }
   if (message?.type === 'HERMES_GET_PAGE_CONTEXT') {
     try {
-      sendResponse(collectContext(message.options || {}));
+      const ctx = collectContext(message.options || {});
+      // 扩展桥: 注入 links（extractor 的 structure.links 未透传到 meta）
+      if (ctx && ctx.ok !== false) {
+        ctx.meta = ctx.meta || {};
+        try { ctx.meta.links = collectPageLinks(); } catch (_e) { /* 链接收集失败不影响主内容 */ }
+      }
+      sendResponse(ctx);
     } catch (error) {
       sendResponse({ ok: false, error: error?.message || String(error) });
     }

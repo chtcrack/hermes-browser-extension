@@ -288,6 +288,42 @@ function handleEvaluateJs({ script }) {
   }
 }
 
+
+/**
+ * 收集页面链接（纯 DOM 读取，不受页面 CSP 限制；供 browse_url 返回帖子链接）
+ * extractor 的 structure.links 未透传到 meta，此函数直接读 DOM 补上
+ */
+function collectPageLinks() {
+  const links = [];
+  const seen = new Set();
+  const anchors = document.querySelectorAll('a[href]');
+  for (const a of anchors) {
+    const href = a.getAttribute('href') || '';
+    if (!href || href.startsWith('javascript:') || href.startsWith('#')) continue;
+    let abs;
+    try { abs = new URL(href, location.href).href; } catch (_e) { continue; }
+    if (!/^https?:/.test(abs)) continue;
+    if (seen.has(abs)) continue;
+    seen.add(abs);
+    const text = (a.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 200);
+    links.push({ text, url: abs });
+    if (links.length >= 100) break;
+  }
+  return links;
+}
+
+/**
+ * 扩展桥: 在页面上下文上注入 meta.links（仅成功读取时注入）
+ * 保持上游的策略门禁与安全边界不变，只在放行后追加链接数据
+ */
+function withPageLinks(ctx) {
+  if (ctx && ctx.ok !== false) {
+    ctx.meta = ctx.meta || {};
+    try { ctx.meta.links = collectPageLinks(); } catch (_e) { /* 链接收集失败不影响主内容 */ }
+  }
+  return ctx;
+}
+
 /**
  * 页面快照 — 收集所有可交互元素
  */
@@ -909,7 +945,7 @@ function collectPageSnapshot() {
               return;
             }
             try {
-              sendResponse(collectContext(message.options || {}));
+              sendResponse(withPageLinks(collectContext(message.options || {})));
             } catch (error) {
               sendResponse({ ok: false, error: error?.message || String(error) });
             }
@@ -922,7 +958,7 @@ function collectPageSnapshot() {
         return false;
       }
       try {
-        sendResponse(collectContext(message.options || {}));
+        sendResponse(withPageLinks(collectContext(message.options || {})));
       } catch (error) {
         sendResponse({ ok: false, error: error?.message || String(error) });
       }

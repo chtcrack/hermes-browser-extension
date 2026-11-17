@@ -116,6 +116,11 @@
     if (!browserControlIndicatorHost || remaining <= 0) {
       removeBrowserControlIndicator();
       return;
+    }
+    if (browserControlIndicatorHideTimer) clearTimeout(browserControlIndicatorHideTimer);
+    browserControlIndicatorHideTimer = setTimeout(removeBrowserControlIndicator, remaining);
+  }
+
 // ============================================================
 // v3: 交互式工具 — 元素查找 / 表单填写 / 点击 / 执行 JS / 页面快照
 // ============================================================
@@ -393,10 +398,6 @@ function collectPageSnapshot() {
   };
 }
 
-    }
-    if (browserControlIndicatorHideTimer) clearTimeout(browserControlIndicatorHideTimer);
-    browserControlIndicatorHideTimer = setTimeout(removeBrowserControlIndicator, remaining);
-  }
 
   function showBrowserControlIndicator(action = '', targetRect = null) {
     removeBrowserControlIndicator();
